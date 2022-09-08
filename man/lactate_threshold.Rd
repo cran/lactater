@@ -45,7 +45,7 @@ only the first 50\% of the data will be used. Default to \code{1}.}
 \item{plot}{A boolean to indicate whether to generate a plot from each one of the methods. Default to \code{TRUE}.}
 }
 \value{
-a \link[tibble:tibble-package]{tibble} with the following columns:
+a tibble with the following columns:
 \item{method_category}{the category of the lactate threshold method.}
 \item{method}{the method used to estimate the lactate threshold}
 \item{fitting}{the fitting method used to predict the lactate curve}
@@ -144,6 +144,7 @@ ratio, which attempts to describe the onset of the lactate increase (Dickhuth et
 }
 }
 \examples{
+\dontrun{
 lactate_threshold(
   .data = demo_data,
   intensity_column = "intensity",
@@ -155,6 +156,7 @@ lactate_threshold(
   loglog_restrainer = 1,
   plot = TRUE
 )
+}
 }
 \references{
 Beaver WL, Wasserman K, Whipp BJ. Improved detection of lactate threshold during exercise using a log-log transformation.

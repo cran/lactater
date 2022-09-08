@@ -1,6 +1,6 @@
 Package: lactater
 Title: Tools for Analyzing Lactate Thresholds
-Version: 0.1.0
+Version: 0.1.1
 Authors@R: 
     person(given = "Felipe",
            family = "Mattioni Maturana",
@@ -27,7 +27,7 @@ Description: Set of tools for analyzing lactate thresholds from a step increment
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
-RoxygenNote: 7.1.2
+RoxygenNote: 7.2.1
 Suggests: bsplus, covr, datapasta, glue, knitr, miniUI, rhandsontable,
         rmarkdown, shiny, shinyjs, shinyWidgets, spelling, testthat (>=
         3.0.0)
@@ -37,9 +37,9 @@ Depends: R (>= 2.10)
 Language: en-US
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2021-12-02 14:40:49 UTC; fmattioni
+Packaged: 2022-09-08 15:22:29 UTC; fmattioni
 Author: Felipe Mattioni Maturana [aut, cre]
     (<https://orcid.org/0000-0002-4221-6104>)
 Maintainer: Felipe Mattioni Maturana <felipe.mattioni@med.uni-tuebingen.de>
 Repository: CRAN
-Date/Publication: 2021-12-03 08:30:02 UTC
+Date/Publication: 2022-09-08 15:32:56 UTC
