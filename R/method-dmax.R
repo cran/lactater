@@ -2,536 +2,103 @@
 #'
 #' It applies the `Dmax` methods: `"Dmax"`, `"ModDmax"`, `"Exp-Dmax"`, `"Log-Poly-ModDmax"`, and `"Log-Exp-ModDmax"`.
 #'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param loglog_restrainer A scalar from 0 to 1 indicating the percentage of the data that you would like to
-#' restrain for fitting the Log-Log method - This is going to be used in the `Log-Poly-ModDmax` and `Log-Exp-ModDmax` methods only.
-#' For example, `1` means no restriction (fits using the whole data), and `0.5` means that
-#' only the first 50% of the data will be used. Default to `1`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
+#' Every variant looks for the point on the fitted curve that lies furthest below a straight
+#' line between two anchors. The variants differ in the fitted curve and in where the line starts:
 #'
-#' ## Fit
+#' * Dmax: 3rd degree polynomial, from the first stage.
+#' * ModDmax: 3rd degree polynomial, from the stage preceding the first rise of at least
+#'   `moddmax_rise` mmol/L.
+#' * Exp-Dmax: exponential plus constant, from the first stage.
+#' * LTP1-Poly-ModDmax: 3rd degree polynomial, from LTP1 (only when requested in `dmax_methods`).
+#' * Log-Poly-ModDmax: 3rd degree polynomial, from the Log-log threshold.
+#' * Log-Exp-ModDmax: exponential plus constant, from the Log-log threshold.
 #'
-#' The `method_dmax()` function does not have a `fit` argument because all the `Dmax` methods have their own default fitting methods:
+#' The line always ends at the last stage. The resting sample is never used. With
+#' `settings$dmax_anchor = "observed"` the line's ends sit at the measured lactate of the start
+#' and end stages instead of on the fitted curve; the Log-log and LTP1 starts have no measured
+#' value, so they always sit on the curve. `"original"` follows each paper: on the curve for Dmax
+#' and Exp-Dmax, at the measured values for the ModDmax variants.
 #'
-#' * Dmax = 3rd degree polynomial
-#' * ModDmax = 3rd degree polynomial
-#' * Exp-Dmax = exponential
-#' * Log-Poly-ModDmax = 3rd degree polynomial
-#' * Log-Exp-ModDmax = exponential
+#' @inheritParams method_obla
 #'
-#' @return a tibble with the following columns:
-#' \item{method}{the method used to estimate the lactate threshold}
-#' \item{fitting}{the fitting method used to predict the lactate curve}
-#' \item{intensity}{the intensity associated with the estimated lactate threshold}
-#' \item{lactate}{the lactate concentration associated with the estimated lactate threshold}
-#' \item{heart_rate}{the heart rate associated with the estimated lactate threshold}
-#' \item{plot}{the plot produced to display the lactate threshold}
-#'
+#' @return a list with the result `rows` (method, fitting, intensity, lactate) and the `plot_data`
+#' for each row.
 #' @keywords internal
-method_dmax <- function(data_prepared, sport, loglog_restrainer = 1, plot) {
+method_dmax <- function(data, curve, settings) {
+  stages <- data[data$intensity > 0, ]
+  n <- nrow(stages)
+  poly <- fit_curve(stages, "3rd degree polynomial")
+  expo <- fit_curve(stages, "Exponential")
 
-  data_processed <- dplyr::tibble(method = c("Dmax", "ModDmax", "Exp-Dmax", "Log-Poly-ModDmax", "Log-Exp-ModDmax")) %>%
-    dplyr::rowwise() %>%
-    dplyr::mutate(
-      results = switch (
-        method,
-        "Dmax" = helper_dmax_dmax(data_prepared = data_prepared, sport = sport, plot = plot) %>% list(),
-        "ModDmax" = helper_dmax_moddmax(data_prepared = data_prepared, sport = sport, plot = plot) %>% list(),
-        "Exp-Dmax" = helper_dmax_exp_dmax(data_prepared = data_prepared, sport = sport, plot = plot) %>% list(),
-        "Log-Poly-ModDmax" = helper_dmax_log_poly_moddmax(data_prepared = data_prepared, sport = sport,  loglog_restrainer = loglog_restrainer, plot = plot) %>% list(),
-        "Log-Exp-ModDmax" = helper_dmax_log_exp_moddmax(data_prepared = data_prepared, sport = sport,  loglog_restrainer = loglog_restrainer, plot = plot) %>% list()
+  ## tolerance: 1.4 - 1.0 is 0.3999... in floating point
+  first_rise <- which(diff(stages$lactate) >= settings$moddmax_rise - 1e-9)[1]
+  wanted <- settings$dmax_methods
+  loglog_intensity <- if(any(grepl("^Log-", wanted))) loglog_breakpoint(stages, settings$loglog_restrainer)$intensity
+  ltp1_intensity <- if("LTP1-Poly-ModDmax" %in% wanted) {
+    fit_breakpoints(
+      stages$intensity, stages$lactate,
+      n_breakpoints = settings$ltp_breakpoints, flat_first = settings$ltp_fix_first_slope
+    )$psi[1]
+  }
+
+  ## original: "the two end points of the curve" (Cheng et al., 1992); ModDmax from "the LT and the final
+  ## lactate point" (Bishop et al., 1998); Log-*-ModDmax to "the final lactate point" (Jamnick et al., 2018)
+  variants <- list(
+    "Dmax" = list(curve = poly, x0 = stages$intensity[1], y0 = stages$lactate[1], original = "fitted"),
+    "ModDmax" = list(
+      curve = poly, x0 = stages$intensity[first_rise], y0 = stages$lactate[first_rise], original = "observed"
+    ),
+    "Exp-Dmax" = list(curve = expo, x0 = stages$intensity[1], y0 = stages$lactate[1], original = "fitted"),
+    "LTP1-Poly-ModDmax" = list(curve = poly, x0 = ltp1_intensity, y0 = NA_real_, original = "observed"),
+    "Log-Poly-ModDmax" = list(curve = poly, x0 = loglog_intensity, y0 = NA_real_, original = "observed"),
+    "Log-Exp-ModDmax" = list(curve = expo, x0 = loglog_intensity, y0 = NA_real_, original = "observed")
+  )[wanted]
+
+  results <- lapply(variants, function(v) {
+    x0 <- v$x0
+    x1 <- stages$intensity[n]
+    anchor <- if(settings$dmax_anchor == "original") v$original else settings$dmax_anchor
+    observed <- anchor == "observed"
+    y0 <- if(is.na(x0)) NA_real_ else if(observed && !is.na(v$y0)) v$y0 else v$curve$predict(x0)
+    y1 <- if(observed) stages$lactate[n] else v$curve$predict(x1)
+    intensity <- dmax_point(v$curve$predict, x0, y0, x1, y1)
+    list(
+      intensity = intensity,
+      lactate = if(is.na(intensity)) NA_real_ else retrieve_lactate(v$curve, intensity),
+      plot_data = list(
+        curve = curve_points(v$curve, from = if(is.na(x0)) v$curve$domain[1] else x0),
+        line = data.frame(intensity = c(x0, x1), lactate = c(y0, y1)),
+        fitting = v$curve$fit
       )
-    ) %>%
-    dplyr::ungroup()
-
-  if(plot) {
-    out <- data_processed %>%
-      dplyr::rowwise() %>%
-      dplyr::mutate(
-        plot = list(suppressWarnings(plot_lactate(data_processed = results, method = method)))
-      ) %>%
-      dplyr::ungroup() %>%
-      tidyr::unnest(cols = results) %>%
-      dplyr::select(dplyr::any_of(c("method", "fitting", "intensity", "lactate", "heart_rate", "plot")))
-  } else {
-    out <- data_processed %>%
-      tidyr::unnest(cols = results) %>%
-      dplyr::select(dplyr::any_of(c("method", "fitting", "intensity", "lactate", "heart_rate")))
-  }
-
-  if(sport == "swimming") {
-    out <- out %>%
-      dplyr::mutate(pace = convert_to_pace(speed = intensity))
-  }
-
-  out <- out %>%
-    dplyr::select(dplyr::any_of(c("method", "fitting", "intensity", "pace", "lactate", "heart_rate", "plot"))) %>%
-    dplyr::mutate(method = factor(method, levels = c("Dmax", "ModDmax", "Exp-Dmax", "Log-Poly-ModDmax", "Log-Exp-ModDmax"))) %>%
-    dplyr::arrange(method)
-
-  out
-}
-
-#' Helper - Dmax
-#'
-#' For internal use only and it won't be exported.
-#'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
-#'
-#' @keywords internal
-helper_dmax_dmax <- function(data_prepared, sport, plot) {
-
-  data_prepared_dmax <- prepare_fit(
-    .data = data_prepared$data[[1]],
-    fit = "3rd degree polynomial",
-    include_baseline = FALSE,
-    sport = {{ sport }}
-  )
-
-  model_coefficients <- broom::tidy(data_prepared_dmax$model[[1]]) %>%
-    dplyr::pull(estimate)
-
-  data_dmax <- data_prepared_dmax$data[[1]][-1, ]
-
-  ## get the difference between the first and last lactate and intensity values
-  diff_lactate <- range(data_dmax$lactate) %>% diff()
-  diff_intensity <- range(data_dmax$intensity) %>% diff()
-
-  ## get the maximal intensity
-  max_intensity <- max(data_dmax$intensity)
-
-  ## the following was based on Lactate-R (http://www.uiginn.com/lactate/lactate-r.html)
-
-  lin_beta <- diff_lactate / diff_intensity
-
-  ### find where the first derivative of the polynomial fit equals the slope of the line
-  d_max <- c(model_coefficients[2] - lin_beta, 2 * model_coefficients[3], 3 * model_coefficients[4]) %>%
-    polyroot() %>%
-    Re()
-  d_max <- d_max[d_max > 0]
-
-  model_intensity <- max(d_max[d_max <= max_intensity])
-  model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-
-  ## this is a workaround to avoid unplausible estimations
-  ## a more elegant and definitive solution needs to be done
-  if(model_lactate > 8) {
-    model_intensity <- min(d_max[d_max <= max_intensity])
-    model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-  }
-
-  if(plot) {
-    ## get data for using in plot later on
-    data_plot_line <- data_dmax %>%
-      dplyr::filter(dplyr::row_number() %in% c(1, dplyr::n()))
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate,
-        data_plot_line = list(data_plot_line)
-      )
-
-  } else {
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate
-      )
-
-  }
-
-  if("heart_rate" %in% colnames(data_prepared$data[[1]])) {
-    out <- out %>%
-      dplyr::mutate(
-        heart_rate = retrieve_heart_rate(raw_data = data_prepared$data[[1]], intensity_value = intensity)
-      )
-  }
-
-  switch (
-    sport,
-    "cycling" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 1)),
-    "running" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 2)),
-    "swimming" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 3))
-  )
-
-  out
-}
-
-#' Helper - ModDmax
-#'
-#' For internal use only and it won't be exported.
-#'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
-#'
-#' @keywords internal
-#' @importFrom utils head tail
-helper_dmax_moddmax <- function(data_prepared, sport, plot) {
-
-  data_dmax <- data_prepared$data[[1]][-1, ]
-
-  ## find the first rise in blood lactate greater than 0.4 mmol/L
-  data_first_rise <- data_dmax %>%
-    dplyr::mutate(diffs = dplyr::lead(lactate) - lactate) %>%
-    dplyr::filter(diffs >= 0.4) %>%
-    head(1)
-
-  if(nrow(data_first_rise) == 0) {
-    out <- dplyr::tibble(
-      fitting = "3rd degree polynomial (default)",
-      intensity = NA,
-      lactate = NA
     )
+  })
 
-    return(out)
-  }
-
-  data_prepared_dmax <- prepare_fit_dmax_mods(
-    .data = data_prepared$data[[1]],
-    fit = "3rd degree polynomial",
-    intensity_to_start = data_first_rise$intensity,
-    sport = {{ sport }}
+  method_result(
+    method = names(variants),
+    fitting = paste(vapply(variants, function(v) v$curve$fit, ""), "(default)"),
+    intensity = vapply(results, `[[`, numeric(1), "intensity"),
+    lactate = vapply(results, `[[`, numeric(1), "lactate"),
+    plot_data = unname(lapply(results, `[[`, "plot_data"))
   )
-
-  model_coefficients <- broom::tidy(data_prepared_dmax$model[[1]]) %>%
-    dplyr::pull(estimate)
-
-  ## get the difference between the first rise greater than 0.4 mmol/L and last lactate and intensity values
-  diff_lactate <- max(data_dmax$lactate) - data_first_rise$lactate
-  diff_intensity <- max(data_dmax$intensity) - data_first_rise$intensity
-
-  ## get the maximal intensity
-  max_intensity <- max(data_dmax$intensity)
-
-  ## the following was based on Lactate-R (http://www.uiginn.com/lactate/lactate-r.html)
-
-  lin_beta <- diff_lactate / diff_intensity
-
-  ### find where the first derivative of the polynomial fit equals the slope of the line
-  d_max <- c(model_coefficients[2] - lin_beta, 2 * model_coefficients[3], 3 * model_coefficients[4]) %>%
-    polyroot() %>%
-    Re()
-  d_max <- d_max[d_max > 0]
-
-  model_intensity <- max(d_max[d_max <= max_intensity])
-  model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-
-  ## this is a workaround to avoid unplausible estimations
-  ## a more elegant and definitive solution needs to be done
-  if(model_lactate > 8) {
-    model_intensity <- min(d_max[d_max <= max_intensity])
-    model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-  }
-
-  if(plot) {
-    ## get data for using in plot later on
-    data_plot_line <- data_dmax %>%
-      tail(1) %>%
-      dplyr::bind_rows(data_first_rise, .) %>%
-      dplyr::select(-diffs)
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate,
-        data_plot_line = list(data_plot_line)
-      )
-
-  } else {
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate
-      )
-
-  }
-
-  if("heart_rate" %in% colnames(data_prepared$data[[1]])) {
-    out <- out %>%
-      dplyr::mutate(
-        heart_rate = retrieve_heart_rate(raw_data = data_prepared$data[[1]], intensity_value = intensity)
-      )
-  }
-
-  switch (
-    sport,
-    "cycling" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 1)),
-    "running" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 2)),
-    "swimming" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 3))
-  )
-
-  out
 }
 
-#' Helper - Exp-Dmax
+#' Dmax point
 #'
-#' For internal use only and it won't be exported.
+#' Finds where the curve lies furthest below the straight line from `(x0, y0)` to `(x1, y1)`.
+#' The perpendicular distance is the vertical distance times a constant, so both peak at the
+#' same intensity. For internal use only.
 #'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
+#' @param curve A function returning the fitted lactate at given intensities.
+#' @param x0,y0 The start of the line.
+#' @param x1,y1 The end of the line.
 #'
+#' @return the intensity, or `NA` when the curve never dips below the line.
 #' @keywords internal
-#' @importFrom utils head tail
-helper_dmax_exp_dmax <- function(data_prepared, sport, plot) {
-
-  data_prepared_dmax <- prepare_fit(
-    .data = data_prepared$data[[1]],
-    fit = "Exponential",
-    include_baseline = FALSE,
-    sport = {{ sport }}
-  )
-
-  model_coefficients <- broom::tidy(data_prepared_dmax$model[[1]]) %>%
-    dplyr::pull(estimate)
-
-  data_dmax <- data_prepared_dmax$data[[1]][-1, ]
-
-  exponential_dmax <- function(c, si, sf) {
-    log((exp(c * sf) - exp(c * si)) / ((c * sf) - (c * si))) / c
-  }
-
-  first_intensity <- head(data_dmax$intensity, 1)
-  last_intensity <- tail(data_dmax$intensity, 1)
-
-  model_intensity <- exponential_dmax(c = model_coefficients[3], si = first_intensity, sf = last_intensity)
-
-  model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-
-  if(plot) {
-    ## get data for using in plot later on
-    data_plot_line <- data_dmax %>%
-      dplyr::filter(dplyr::row_number() %in% c(1, dplyr::n()))
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "Exponential (default)",
-        intensity = model_intensity,
-        lactate = model_lactate,
-        data_plot_line = list(data_plot_line)
-      )
-
-  } else {
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "Exponential (default)",
-        intensity = model_intensity,
-        lactate = model_lactate
-      )
-
-  }
-
-  if("heart_rate" %in% colnames(data_prepared$data[[1]])) {
-    out <- out %>%
-      dplyr::mutate(
-        heart_rate = retrieve_heart_rate(raw_data = data_prepared$data[[1]], intensity_value = intensity)
-      )
-  }
-
-  switch (
-    sport,
-    "cycling" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 1)),
-    "running" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 2)),
-    "swimming" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 3))
-  )
-
-  out
+dmax_point <- function(curve, x0, y0, x1, y1) {
+  if (anyNA(c(x0, y0, x1, y1)) || x1 <= x0) return(NA_real_)
+  below_line <- function(x) y0 + (y1 - y0) / (x1 - x0) * (x - x0) - curve(x)
+  grid <- seq(x0, x1, length.out = 1001)
+  values <- below_line(grid)
+  if (max(values) <= 0) return(NA_real_)
+  refine_extremum(below_line, grid, values, maximum = TRUE)$maximum
 }
-
-#' Helper - Log-Poly-ModDmax
-#'
-#' For internal use only and it won't be exported.
-#'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param loglog_restrainer A scalar from 0 to 1 indicating the percentage of the data that you would like to
-#' restrain for fitting the Log-Log method. For example, `1` means no restriction (fits using the whole data), and `0.5` means that
-#' only the first 50% of the data will be used. Default to `1`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
-#'
-#' @keywords internal
-#' @importFrom utils tail
-helper_dmax_log_poly_moddmax <- function(data_prepared, sport, loglog_restrainer, plot) {
-
-  ## calculate Log-log
-  results_loglog <- method_loglog(data_prepared = {{ data_prepared }}, fit = "3rd degree polynomial", sport = {{ sport }}, loglog_restrainer = {{ loglog_restrainer }}, plot = FALSE)
-
-  ## prepare data again, but this time only with the necessary data for the Dmax fit
-  data_prepared_dmax <- prepare_fit_dmax_mods(
-    .data = data_prepared$data[[1]],
-    fit = "3rd degree polynomial",
-    intensity_to_start = results_loglog$intensity,
-    sport = {{ sport }}
-  )
-
-  model_coefficients <- broom::tidy(data_prepared_dmax$model[[1]]) %>%
-    dplyr::pull(estimate)
-
-  data_dmax <- data_prepared_dmax$data[[1]][-1, ]
-
-  ## get the last lactate and intensity values
-  last_lactate <- tail(data_dmax$lactate, 1)
-  last_intensity <- tail(data_dmax$intensity, 1)
-
-  ## get the maximal intensity
-  max_intensity <- max(data_dmax$intensity)
-
-  ## the following was based on Lactate-R (http://www.uiginn.com/lactate/lactate-r.html)
-
-  lin_beta <- (last_lactate - results_loglog$lactate) / (last_intensity - results_loglog$intensity)
-
-  ### find where the first derivative of the polynomial fit equals the slope of the line
-  d_max <- c(model_coefficients[2] - lin_beta, 2 * model_coefficients[3], 3 * model_coefficients[4]) %>%
-    polyroot() %>%
-    Re()
-  d_max <- d_max[d_max > 0]
-
-  model_intensity <- max(d_max[d_max <= max_intensity])
-  model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-
-  ## this is a workaround to avoid unplausible estimations
-  ## a more elegant and definitive solution needs to be done
-  if(model_lactate > 8) {
-    model_intensity <- min(d_max[d_max <= max_intensity])
-    model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-  }
-
-  if(plot) {
-    ## get data for using in plot later on
-    data_plot_line <- data_dmax %>%
-      tail(1) %>%
-      dplyr::bind_rows(dplyr::select(results_loglog, lactate, intensity), .)
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate,
-        data_plot_line = list(data_plot_line)
-      )
-
-  } else {
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "3rd degree polynomial (default)",
-        intensity = model_intensity,
-        lactate = model_lactate
-      )
-
-  }
-
-  if("heart_rate" %in% colnames(data_prepared$data[[1]])) {
-    out <- out %>%
-      dplyr::mutate(
-        heart_rate = retrieve_heart_rate(raw_data = data_prepared$data[[1]], intensity_value = intensity)
-      )
-  }
-
-  switch (
-    sport,
-    "cycling" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 1)),
-    "running" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 2)),
-    "swimming" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 3))
-  )
-
-  out
-}
-
-#' Helper - Log-Exp-ModDmax
-#'
-#' For internal use only and it won't be exported.
-#'
-#' @param data_prepared The data retrieved from `prepare_data()`.
-#' @param sport The sport at which the incremental test was performed. One of `cycling`, `running`, or `swimming`.
-#' @param loglog_restrainer A scalar from 0 to 1 indicating the percentage of the data that you would like to
-#' restrain for fitting the Log-Log method. For example, `1` means no restriction (fits using the whole data), and `0.5` means that
-#' only the first 50% of the data will be used. Default to `1`.
-#' @param plot A boolean to indicate whether to generate a plot from each one of the methods.
-#'
-#' @keywords internal
-#' @importFrom utils tail
-helper_dmax_log_exp_moddmax <- function(data_prepared, sport, loglog_restrainer, plot) {
-
-  ## calculate Log-log
-  results_loglog <- method_loglog(data_prepared = {{ data_prepared }}, fit = "Exponential", sport = {{ sport }}, loglog_restrainer = {{ loglog_restrainer }}, plot = FALSE)
-
-  ## prepare data again, but this time only with the necessary data for the Dmax fit
-  data_prepared_dmax <- prepare_fit_dmax_mods(
-    .data = data_prepared$data[[1]],
-    fit = "Exponential",
-    intensity_to_start = results_loglog$intensity,
-    sport = {{ sport }}
-  )
-
-  model_coefficients <- broom::tidy(data_prepared_dmax$model[[1]]) %>%
-    dplyr::pull(estimate)
-
-  data_dmax <- data_prepared_dmax$data[[1]][-1, ]
-
-  exponential_dmax <- function(c, si, sf) {
-    log((exp(c * sf) - exp(c * si)) / ((c * sf) - (c * si))) / c
-  }
-
-
-  ## get last intensity
-  last_intensity <- tail(data_dmax$intensity, 1)
-
-  model_intensity <- exponential_dmax(c = model_coefficients[3], si = results_loglog$intensity, sf = last_intensity)
-
-  model_lactate <- retrieve_lactate(model = data_prepared_dmax$model[[1]], intensity_value = model_intensity)
-
-  if(plot) {
-    ## get data for using in plot later on
-    data_plot_line <- data_dmax %>%
-      tail(1) %>%
-      dplyr::bind_rows(dplyr::select(results_loglog, lactate, intensity), .)
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "Exponential (default)",
-        intensity = model_intensity,
-        lactate = model_lactate,
-        data_plot_line = list(data_plot_line)
-      )
-
-  } else {
-
-    out <- data_prepared_dmax %>%
-      dplyr::mutate(
-        fitting = "Exponential (default)",
-        intensity = model_intensity,
-        lactate = model_lactate
-      )
-
-  }
-
-  if("heart_rate" %in% colnames(data_prepared$data[[1]])) {
-    out <- out %>%
-      dplyr::mutate(
-        heart_rate = retrieve_heart_rate(raw_data = data_prepared$data[[1]], intensity_value = intensity)
-      )
-  }
-
-  switch (
-    sport,
-    "cycling" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 1)),
-    "running" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 2)),
-    "swimming" = out <- out %>% dplyr::mutate(intensity = round(x = intensity, digits = 3))
-  )
-
-  out
-}
-
